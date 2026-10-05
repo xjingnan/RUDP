@@ -94,7 +94,10 @@ inline uint16_t compute_packet_checksum(const char* header,size_t header_len,con
 {
     std::vector<uint8_t> combined(header_len+data_len);
     std::memcpy(combined.data(),header,header_len);
-    std::memcpy(combined.data()+header_len,data,data_len);
+    if(data_len>0)
+    {
+        std::memcpy(combined.data()+header_len,data,data_len);
+    }
     combined[12]=0;
     combined[13]=0;
     return crc16(combined.data(),combined.size());
