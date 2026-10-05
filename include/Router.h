@@ -14,7 +14,7 @@ private:
     std::map<NodeId,sockaddr_in> neighbors_;
     std::unordered_set<uint32_t> rreq_seen_;
 private:
-    void send_rrep(NodeId dst,const sockaddr_in& dst_addr,int sock_fd);
+    void send_rrep(NodeId dst,const sockaddr_in& dst_addr,NodeId advertised_dst,int sock_fd);
 public:
     explicit Router(NodeId my_id);
 
