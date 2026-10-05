@@ -41,7 +41,7 @@ void Router::handle_rreq(const char* buffer,size_t len,NodeId src,NodeId dst,uin
     if(dst==my_id_||routing_table_.find(dst)!=routing_table_.end())
     {
         //自己是目标或者已有路由，回复RREP
-        send_rrep(src,src_addr,sock_fd);
+        send_rrep(src,src_addr,dst,sock_fd);
     }
     else
     {
@@ -61,35 +61,28 @@ void Router::handle_rreq(const char* buffer,size_t len,NodeId src,NodeId dst,uin
     }
 }
 
-void Router::send_rrep(NodeId dst,const sockaddr_in& dst_addr,int sock_fd)
+void Router::send_rrep(NodeId dst,const sockaddr_in& dst_addr,NodeId advertised_dst,int sock_fd)
 {
-    char header[HEADER_SIZE];
-    serialize_header(0,0,FLAG_RREP,0,0,header);
-    uint16_t csum=compute_packet_checksum(header,HEADER_SIZE,nullptr,0);
-    serialize_header(0,0,FLAG_RREP,0,csum,header);
+    char packet[HEADER_SIZE+12]{};
+    char* header=packet;
+    const uint16_t payload_len=sizeof(NodeId);
+    serialize_header(0,0,FLAG_RREP,payload_len,0,header);
+    NodeId net_src=htonl(my_id_);
+    NodeId net_dst=htonl(dst);
+    NodeId net_advertised_dst=htonl(advertised_dst);
+    std::memcpy(packet+HEADER_SIZE,&net_src,sizeof(net_src));
+    std::memcpy(packet+HEADER_SIZE+4,&net_dst,sizeof(net_dst));
+    std::memcpy(packet+HEADER_SIZE+8,&net_advertised_dst,sizeof(net_advertised_dst));
+    uint16_t csum=compute_packet_checksum(header,HEADER_SIZE,packet+HEADER_SIZE+8,payload_len);
+    serialize_header(0,0,FLAG_RREP,payload_len,csum,header);
 
-    NodeId net_my=htonl(my_id_);
-    struct iovec iov[2];
-    iov[0].iov_base=header;
-    iov[0].iov_len=HEADER_SIZE;
-    iov[1].iov_base=&net_my;
-    iov[1].iov_len=4;
-    
-    msghdr msg{};
-    msg.msg_iov=iov;
-    msg.msg_iovlen=2;
-    msg.msg_name=const_cast<sockaddr*>(reinterpret_cast<const sockaddr*>(&dst_addr));
-    msg.msg_namelen=sizeof(dst_addr);
-
-    if(sendmsg(sock_fd,&msg,0)<0)
+    if(sendto(sock_fd,packet,sizeof(packet),0,reinterpret_cast<const sockaddr*>(&dst_addr),sizeof(dst_addr))<0)
     {
-        log(LogLevel::ERROR,"sendmsg RREP failed");
+        log(LogLevel::ERROR,"sendto RREP failed");
     }
     else
     {
         log(LogLevel::INFO,"Sent RREP to "+std::to_string(dst));
     }
 }
-
-
 
