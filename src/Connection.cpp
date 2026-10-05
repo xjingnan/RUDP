@@ -4,6 +4,9 @@
 #include<unistd.h>
 #include<cstring>
 #include<iostream>
+#include<algorithm>
+#include<cerrno>
+#include<cmath>
 
 Connection::Connection(NodeId remote_id,sockaddr_in remote_addr,NodeId my_id)
     :remote_id_(remote_id),my_id_(my_id),remote_addr_(remote_addr),state_(State::CLOSED),next_seq_(1),base_seq_(1),expected_seq_(1),cwnd_(1),ssthresh_(64),rtt_(std::chrono::milliseconds(0)),rtt_var_(std::chrono::milliseconds(0)),rto_(std::chrono::milliseconds(200)){}
@@ -11,18 +14,29 @@ Connection::Connection(NodeId remote_id,sockaddr_in remote_addr,NodeId my_id)
 
 void Connection::send_data(const std::string& data,BufferPool& pool,int sock_fd,const sockaddr_in& next_hop)
 {
+    (void)pool;
     if(state_!=State::ESTABLISHED)
     {
         //简化：自动进入ESTABLISHED状态
         state_=State::ESTABLISHED;
     }
-    if(send_packets_.size()>=SEND_WINDOW_SIZE)
+    if(data.size()>MAX_DATA_LEN)
+    {
+        log(LogLevel::WARN,"Payload exceeds maximum RUDP data length");
+        return;
+    }
+    if(data.empty())
+    {
+        log(LogLevel::WARN,"Empty DATA payload is not supported");
+        return;
+    }
+    if(send_packets_.size()>=std::min<size_t>(cwnd_,SEND_WINDOW_SIZE))
     {
         log(LogLevel::WARN,"Send window full, drop data");
         return;
     }
 
-    uint32_t seq=next_seq_++;
+    uint32_t seq=next_seq_;
     uint16_t data_len=static_cast<uint16_t>(data.size());
 
     //构造头部
@@ -34,7 +48,7 @@ void Connection::send_data(const std::string& data,BufferPool& pool,int sock_fd,
     NodeId net_src=htonl(my_id_);
     NodeId net_dst=htonl(remote_id_);
 
-    //使用iover零拷贝发送
+    // Send header, node IDs, and payload without assembling a temporary buffer.
     struct iovec iov[4];
     iov[0].iov_base=header;
     iov[0].iov_len=HEADER_SIZE;
@@ -57,6 +71,7 @@ void Connection::send_data(const std::string& data,BufferPool& pool,int sock_fd,
         log(LogLevel::ERROR,"sendmsg failed: "+std::string(strerror(errno)));
         return;
     }
+    ++next_seq_;
 
     //保存完整包用于重传
     std::vector<char> packet(HEADER_SIZE+8+data_len);
@@ -79,13 +94,15 @@ void Connection::send_data(const std::string& data,BufferPool& pool,int sock_fd,
 
 void Connection::handle_packet(const char* buffer,size_t len,NodeId src_id,NodeId dst_id,uint32_t seq,uint32_t ack,uint16_t flags,uint16_t length,int sock_fd, const sockaddr_in& next_hop)
 {
+    (void)src_id;
+    (void)dst_id;
     if(flags&FLAG_ACK)
     {
         handle_ack(ack, sock_fd, next_hop);
     }
     if(flags&FLAG_DATA)
     {
-        handle_data(buffer,len,seq,length);
+        handle_data(buffer,len,seq,length,sock_fd,next_hop);
     }
 }
 
@@ -102,7 +119,10 @@ void Connection::handle_ack(uint32_t ack_seq,int sock_fd,const sockaddr_in& next
             it->second->acked=true;
             auto now=std::chrono::steady_clock::now();
             auto rtt_sample=std::chrono::duration_cast<std::chrono::milliseconds>(now-it->second->send_time);
-            update_rtt(rtt_sample);
+            if(it->second->retrans_count==0)
+            {
+                update_rtt(rtt_sample);
+            }
 
             //拥塞控制
             if(cwnd_<ssthresh_)
@@ -111,7 +131,12 @@ void Connection::handle_ack(uint32_t ack_seq,int sock_fd,const sockaddr_in& next
             }
             else
             {
-                cwnd_+=1.0/cwnd_;//拥塞避免
+                ++congestion_avoidance_acks_;
+                if(congestion_avoidance_acks_>=cwnd_)
+                {
+                    ++cwnd_;
+                    congestion_avoidance_acks_=0;
+                }
             }
 
             while(send_packets_.find(base_seq_)!=send_packets_.end()&&send_packets_[base_seq_]->acked)
@@ -121,9 +146,9 @@ void Connection::handle_ack(uint32_t ack_seq,int sock_fd,const sockaddr_in& next
             }
         }
     }
-    else
+    else if(ack_seq==base_seq_-1)
     {
-        // 2. 收到了“重复 ACK”（ack_seq < base_seq_，说明 base_seq_ 丢了）
+        // Repeated cumulative ACK means the earliest outstanding packet may be lost.
         dup_ack_count_++;
 
         if(dup_ack_count_==3)
@@ -138,7 +163,14 @@ void Connection::handle_ack(uint32_t ack_seq,int sock_fd,const sockaddr_in& next
             auto it=send_packets_.find(base_seq_);
             if(it!=send_packets_.end())
             {
-               ssize_t sent=sendto(sock_fd,it->second->data.data(),it->second->len,0,reinterpret_cast<const sockaddr*>(&next_hop),sizeof(next_hop));
+                if(it->second->retrans_count>=MAX_RETRANSMIT)
+                {
+                    log(LogLevel::ERROR,"Maximum retransmissions reached for seq "+std::to_string(it->second->seq));
+                    state_=State::CLOSED;
+                    send_packets_.clear();
+                    return;
+                }
+                ssize_t sent=sendto(sock_fd,it->second->data.data(),it->second->len,0,reinterpret_cast<const sockaddr*>(&next_hop),sizeof(next_hop));
                 if (sent > 0) {
                     it->second->send_time = std::chrono::steady_clock::now();
                     it->second->retrans_count++;
@@ -150,18 +182,43 @@ void Connection::handle_ack(uint32_t ack_seq,int sock_fd,const sockaddr_in& next
     }
 }
 
-void Connection::handle_data(const char* buffer,size_t len,uint32_t seq,uint16_t length)
+void Connection::send_ack(uint32_t ack_seq,int sock_fd,const sockaddr_in& next_hop)
 {
-    if(length==0)return;
+    char packet[HEADER_SIZE+8]{};
+    serialize_header(0,ack_seq,FLAG_ACK,0,0,packet);
+    uint16_t checksum=compute_packet_checksum(packet,HEADER_SIZE,nullptr,0);
+    serialize_header(0,ack_seq,FLAG_ACK,0,checksum,packet);
+    uint32_t net_src=htonl(my_id_);
+    uint32_t net_dst=htonl(remote_id_);
+    std::memcpy(packet+HEADER_SIZE,&net_src,sizeof(net_src));
+    std::memcpy(packet+HEADER_SIZE+4,&net_dst,sizeof(net_dst));
+    if(sendto(sock_fd,packet,sizeof(packet),0,reinterpret_cast<const sockaddr*>(&next_hop),sizeof(next_hop))<0)
+    {
+        log(LogLevel::ERROR,"Failed to send ACK: "+std::string(strerror(errno)));
+    }
+}
+
+void Connection::handle_data(const char* buffer,size_t len,uint32_t seq,uint16_t length,int sock_fd,const sockaddr_in& next_hop)
+{
+    if(len<HEADER_SIZE+8+length)
+    {
+        log(LogLevel::WARN,"Truncated DATA packet");
+        return;
+    }
+    if(length==0)
+    {
+        send_ack(expected_seq_-1,sock_fd,next_hop);
+        return;
+    }
     const char* payload=buffer+HEADER_SIZE+8;
     std::string_view data_view(payload,length);
     if(seq==expected_seq_)
     {
         deliver_data(data_view);
-        expected_seq_++;;
+        expected_seq_++;
         while(recv_buffer_.find(expected_seq_)!=recv_buffer_.end())
         {
-            deliver_data(recv_buffer_[expected_seq_]);
+            deliver_data(recv_buffer_.at(expected_seq_));
             recv_buffer_.erase(expected_seq_);
             expected_seq_++;
         }
@@ -170,7 +227,7 @@ void Connection::handle_data(const char* buffer,size_t len,uint32_t seq,uint16_t
     {
         if(recv_buffer_.find(seq)==recv_buffer_.end())
         {
-            recv_buffer_[seq]==std::string(data_view);
+            recv_buffer_[seq]=std::string(data_view);
             log(LogLevel::INFO,"Cached seq="+std::to_string(seq));
         }
     }
@@ -178,6 +235,7 @@ void Connection::handle_data(const char* buffer,size_t len,uint32_t seq,uint16_t
     {
         log(LogLevel::WARN,"Duplicate or out-of-order seq="+std::to_string(seq));
     }
+    send_ack(expected_seq_-1,sock_fd,next_hop);
 }
 
 void Connection::deliver_data(std::string_view data)
@@ -203,8 +261,10 @@ void Connection::check_timeout(int sock_fd,const sockaddr_in& next_hop)
             cwnd_=1;
             if(pkt->retrans_count>=MAX_RETRANSMIT)
             {
-                log(LogLevel::ERROR,"Max restrainsmit for seq "+std::to_string(pkt->seq));
-
+                log(LogLevel::ERROR,"Maximum retransmissions reached for seq "+std::to_string(pkt->seq));
+                state_=State::CLOSED;
+                send_packets_.clear();
+                return;
             }
             else
             {
@@ -214,7 +274,7 @@ void Connection::check_timeout(int sock_fd,const sockaddr_in& next_hop)
                 {
                     pkt->send_time=now;
                     pkt->retrans_count++;
-                    rto_ = rto_ = std::min(rto_ * 2, std::chrono::milliseconds(60000));;
+                    rto_ = std::min(rto_ * 2, std::chrono::milliseconds(60000));
                     log(LogLevel::INFO,"Retransmit seq "+std::to_string(pkt->seq)+" count="+std::to_string(pkt->retrans_count));
                 }
             }
@@ -253,5 +313,3 @@ void Connection::update_rtt(std::chrono::milliseconds rtt_samples)
     // G 是时钟粒度，这里我们取 1 毫秒作为最小粒度
     rto_ = rtt_ + std::max(rtt_var_ * 4, std::chrono::milliseconds(1));
 }
-
-
