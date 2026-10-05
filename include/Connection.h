@@ -26,7 +26,8 @@ private:
 
 private:
     void handle_ack(uint32_t ack_seq,int sock_fd,const sockaddr_in& next_hop);
-    void handle_data(const char* buffer,size_t len,uint32_t seq,uint16_t length);
+    void handle_data(const char* buffer,size_t len,uint32_t seq,uint16_t length,int sock_fd,const sockaddr_in& next_hop);
+    void send_ack(uint32_t ack_seq,int sock_fd,const sockaddr_in& next_hop);
     void deliver_data(std::string_view data);
     void update_rtt(std::chrono::milliseconds rtt_samples);
 
@@ -48,6 +49,7 @@ private:
     std::unordered_map<uint32_t,std::shared_ptr<SendPacket>> send_packets_;
     std::unordered_map<uint32_t, std::string> recv_buffer_;
     uint32_t dup_ack_count_ = 0; // 记录连续收到相同 ACK 的次数
+    uint32_t congestion_avoidance_acks_ = 0;
 public:
     Connection(NodeId remote_id,sockaddr_in remote_addr,NodeId my_id);
     ~Connection();
